@@ -1,8 +1,100 @@
- version: 2
- jobs:
-   build:
-     docker:
-       - image: circleci/ruby:2.4.1
-     steps:
-       - checkout
-       - run: echo "A first hello"
+version: 2.1
+parameters:
+  ApplicationScope:
+    type: string
+    default: "dummy"
+  ApplicationScopeWithTests:
+    type: string
+    default: "dummy"
+  ArtifactsFolder:
+    type: string
+    default: "Artifacts"
+jobs:
+  build:
+    environment:
+      OSPackageVersion: 0.3.1
+      LifeTimeHostname: https://abeamconsulting-lt.outsystemsenterprise.com
+      LifeTimeAPIVersion: 2
+      DevelopmentEnvironment: Development
+      RegressionEnvironment: Testing
+      ProbeEnvironmentURL: https://abeamconsulting-tst.outsystemsenterprise.com
+      BddEnvironmentURL: https://abeamconsulting-tst.outsystemsenterprise.com
+    docker:
+      - image: circleci/python:3.7.3
+    steps:
+      - run:
+          command: |
+            mkdir << pipeline.parameters.ArtifactsFolder >>
+            
+      - run: # pythonパッケージインストール
+          command: |
+            sudo pip install -U outsystems-pipeline==$OSPackageVersion
+            
+      - run: # LifeTimeからデータ取得
+          command: |
+            python -m outsystems.pipeline.fetch_lifetime_data --artifacts << pipeline.parameters.ArtifactsFolder >> --lt_url $LifeTimeHostname --lt_token $LifeTimeTOK --lt_api_version $LifeTimeAPIVersion
+            
+      - run: # リグレッション環境にデプロイ
+          command: |
+            python -m outsystems.pipeline.deploy_latest_tags_to_target_env --artifacts << pipeline.parameters.ArtifactsFolder >> --lt_url $LifeTimeHostname --lt_token $LifeTimeTOK --lt_api_version $LifeTimeAPIVersion --source_env $DevelopmentEnvironment --destination_env $RegressionEnvironment --app_list "<< pipeline.parameters.ApplicationScopeWithTests >>"
+
+      - run: # 実行対象BDDエンドポイント取得
+          command: |
+            python -m outsystems.pipeline.generate_unit_testing_assembly --artifacts << pipeline.parameters.ArtifactsFolder >> --app_list "<< pipeline.parameters.ApplicationScopeWithTests >>" --cicd_probe_env $ProbeEnvironmentURL --bdd_framework_env $BddEnvironmentURL
+            
+      - run: # BDDによるテスト実行とテスト結果の書き出し
+          command: |
+            python -m outsystems.pipeline.evaluate_test_results --artifacts << pipeline.parameters.ArtifactsFolder >> |
+            exit 0
+            
+      # テスト結果をCircleCIに出力
+      - store_test_results:
+          path: << pipeline.parameters.ArtifactsFolder >>
+
+      # アーティファクトをCircleCIに出力
+      - store_artifacts:
+          path: << pipeline.parameters.ArtifactsFolder >>
+          
+      # Artifactをキャッシュに格納（後続jobsで使用）
+      - save_cache:
+          key: v1-Artifacts
+          paths:
+            - << pipeline.parameters.ArtifactsFolder >>
+          
+  deploy:
+    environment:
+      OSPackageVersion: 0.3.1
+      LifeTimeHostname: https://abeamconsulting-lt.outsystemsenterprise.com
+      LifeTimeAPIVersion: 2
+      RegressionEnvironment: Testing
+      AcceptanceEnvironment: Production
+    docker:
+      - image: circleci/python:3.7.3
+    steps:
+      - restore_cache: # キャッシュからArtivactをリストア
+          key: v1-Artifacts
+            
+      - run: # pythonパッケージインストール
+          command: |
+            sudo pip install -U outsystems-pipeline==$OSPackageVersion
+            
+      - run: # Acceptance環境にデプロイ
+          command: |
+            python -m outsystems.pipeline.deploy_latest_tags_to_target_env --artifacts << pipeline.parameters.ArtifactsFolder >> --lt_url $LifeTimeHostname --lt_token $LifeTimeTOK --lt_api_version $LifeTimeAPIVersion --source_env $RegressionEnvironment --destination_env $AcceptanceEnvironment --app_list "<< pipeline.parameters.ApplicationScope >>"
+
+      # アーティファクトをCircleCIに出力
+      - store_artifacts:
+          path: << pipeline.parameters.ArtifactsFolder >>
+          
+workflows:
+  version: 2
+  build_and_deploy:
+    jobs:
+      - build
+      - approval-deploy:
+          type: approval
+          requires:
+            - build
+      - deploy:
+          requires:
+            - approval-deploy
